@@ -174,16 +174,25 @@ Sessions reset based on configurable policies:
 | Idle | 1440 min | Reset after N minutes of inactivity |
 | Both | (combined) | Whichever triggers first |
 
-Configure per-platform overrides in `~/.hermes/gateway.json`:
+Configure per-platform or per-type overrides under `session_reset` in `~/.hermes/config.yaml`:
 
-```json
-{
-  "reset_by_platform": {
-    "telegram": { "mode": "idle", "idle_minutes": 240 },
-    "discord": { "mode": "idle", "idle_minutes": 60 }
-  }
-}
+```yaml
+session_reset:
+  mode: both           # daily, idle, both, none
+  at_hour: 4
+  idle_minutes: 1440
+  by_platform:
+    telegram: { mode: idle, idle_minutes: 240 }
+    discord:  { mode: none }
+  by_type:
+    thread: { mode: none }   # applies to sessions whose type is "thread", such as Discord threads
 ```
+
+Resolution priority: `by_platform` > `by_type` > top-level default.
+
+Telegram topics resolve with `chat_type: forum`, so `by_type.thread` does not match them — use `by_type.forum` to target Telegram topic sessions.
+
+The legacy `~/.hermes/gateway.json` form (`reset_by_platform` / `reset_by_type` at top level) is still honored for backwards compatibility, but new configs should use `config.yaml`.
 
 ## Security
 

@@ -1,5 +1,6 @@
 """Tests for gateway configuration management."""
 
+import json
 import os
 from unittest.mock import patch
 
@@ -199,6 +200,9 @@ class TestGatewayConfigRoundtrip:
             quick_commands={"limits": {"type": "exec", "command": "echo ok"}},
             group_sessions_per_user=False,
             thread_sessions_per_user=True,
+            default_reset_policy=SessionResetPolicy(mode="idle", idle_minutes=30),
+            reset_by_type={"thread": SessionResetPolicy(mode="none")},
+            reset_by_platform={Platform.DISCORD: SessionResetPolicy(mode="daily", at_hour=5)},
         )
         d = config.to_dict()
         restored = GatewayConfig.from_dict(d)
@@ -209,6 +213,11 @@ class TestGatewayConfigRoundtrip:
         assert restored.quick_commands == {"limits": {"type": "exec", "command": "echo ok"}}
         assert restored.group_sessions_per_user is False
         assert restored.thread_sessions_per_user is True
+        assert restored.default_reset_policy.mode == "idle"
+        assert restored.default_reset_policy.idle_minutes == 30
+        assert restored.reset_by_type["thread"].mode == "none"
+        assert restored.reset_by_platform[Platform.DISCORD].mode == "daily"
+        assert restored.reset_by_platform[Platform.DISCORD].at_hour == 5
 
     def test_roundtrip_preserves_unauthorized_dm_behavior(self):
         config = GatewayConfig(
@@ -376,6 +385,263 @@ class TestLoadGatewayConfig:
         config = load_gateway_config()
 
         assert config.default_reset_policy.notify is False
+
+    def test_session_reset_by_platform_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "session_reset:\n"
+            "  mode: both\n"
+            "  idle_minutes: 1440\n"
+            "  by_platform:\n"
+            "    discord:\n"
+            "      mode: none\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        # Default policy still derives from the top-level keys.
+        assert config.default_reset_policy.mode == "both"
+        assert config.default_reset_policy.idle_minutes == 1440
+        # Per-platform override is registered and resolved by priority.
+        assert Platform.DISCORD in config.reset_by_platform
+        assert config.reset_by_platform[Platform.DISCORD].mode == "none"
+        assert config.get_reset_policy(platform=Platform.DISCORD).mode == "none"
+        assert config.get_reset_policy(platform=Platform.TELEGRAM).mode == "both"
+
+    def test_session_reset_by_type_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "session_reset:\n"
+            "  mode: both\n"
+            "  by_type:\n"
+            "    thread:\n"
+            "      mode: none\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert "thread" in config.reset_by_type
+        assert config.reset_by_type["thread"].mode == "none"
+        assert config.get_reset_policy(session_type="thread").mode == "none"
+        assert config.get_reset_policy(session_type="dm").mode == "both"
+
+    def test_session_reset_invalid_by_platform_is_ignored(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        # by_platform must be a mapping; a list should be skipped with a warning,
+        # not crash the loader, and the default policy should still apply.
+        config_path.write_text(
+            "session_reset:\n"
+            "  mode: idle\n"
+            "  idle_minutes: 60\n"
+            "  by_platform:\n"
+            "    - discord\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.default_reset_policy.mode == "idle"
+        assert config.default_reset_policy.idle_minutes == 60
+        assert config.reset_by_platform == {}
+
+    def test_session_reset_invalid_by_platform_entry_is_ignored(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        # Individual platform policies must be mappings; invalid children should
+        # be skipped without crashing the loader.
+        config_path.write_text(
+            "session_reset:\n"
+            "  by_platform:\n"
+            "    discord: none\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.reset_by_platform == {}
+
+    def test_session_reset_yaml_override_preserves_gateway_json_default(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        gateway_json_path = hermes_home / "gateway.json"
+        gateway_json_path.write_text(
+            json.dumps({
+                "default_reset_policy": {"mode": "idle", "idle_minutes": 30},
+            }),
+            encoding="utf-8",
+        )
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "session_reset:\n"
+            "  by_platform:\n"
+            "    discord:\n"
+            "      mode: none\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.default_reset_policy.mode == "idle"
+        assert config.default_reset_policy.idle_minutes == 30
+        assert config.get_reset_policy(platform=Platform.DISCORD).mode == "none"
+        assert config.get_reset_policy(platform=Platform.TELEGRAM).mode == "idle"
+
+    def test_session_reset_yaml_omits_by_platform_preserves_gateway_json_overrides(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        gateway_json_path = hermes_home / "gateway.json"
+        gateway_json_path.write_text(
+            json.dumps({
+                "reset_by_platform": {
+                    "discord": {"mode": "idle", "idle_minutes": 60},
+                },
+            }),
+            encoding="utf-8",
+        )
+        config_path = hermes_home / "config.yaml"
+        # YAML overrides the default but says nothing about by_platform —
+        # gateway.json's per-platform overrides should survive.
+        config_path.write_text(
+            "session_reset:\n"
+            "  mode: both\n"
+            "  idle_minutes: 1440\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.default_reset_policy.mode == "both"
+        assert config.get_reset_policy(platform=Platform.DISCORD).mode == "idle"
+        assert config.get_reset_policy(platform=Platform.DISCORD).idle_minutes == 60
+
+    def test_session_reset_empty_by_platform_is_no_op(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        gateway_json_path = hermes_home / "gateway.json"
+        gateway_json_path.write_text(
+            json.dumps({
+                "reset_by_platform": {
+                    "discord": {"mode": "idle", "idle_minutes": 60},
+                },
+            }),
+            encoding="utf-8",
+        )
+        config_path = hermes_home / "config.yaml"
+        # An empty mapping is a no-op (mirrors the pre-change semantics of
+        # an empty top-level `session_reset:` block): gateway.json overrides
+        # survive.  To drop them, remove the keys from gateway.json itself.
+        config_path.write_text(
+            "session_reset:\n"
+            "  by_platform: {}\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.get_reset_policy(platform=Platform.DISCORD).mode == "idle"
+        assert config.get_reset_policy(platform=Platform.DISCORD).idle_minutes == 60
+
+    def test_session_reset_invalid_by_type_is_ignored(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        # by_type must be a mapping; a list should be skipped without crashing
+        # the loader, and the default policy should still apply.
+        config_path.write_text(
+            "session_reset:\n"
+            "  mode: idle\n"
+            "  idle_minutes: 60\n"
+            "  by_type:\n"
+            "    - thread\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.default_reset_policy.mode == "idle"
+        assert config.default_reset_policy.idle_minutes == 60
+        assert config.reset_by_type == {}
+
+    def test_session_reset_full_block_populates_all_layers(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "session_reset:\n"
+            "  mode: both\n"
+            "  idle_minutes: 720\n"
+            "  by_platform:\n"
+            "    discord:\n"
+            "      mode: none\n"
+            "  by_type:\n"
+            "    thread:\n"
+            "      mode: idle\n"
+            "      idle_minutes: 120\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.default_reset_policy.mode == "both"
+        assert config.default_reset_policy.idle_minutes == 720
+        assert config.reset_by_platform[Platform.DISCORD].mode == "none"
+        assert config.reset_by_type["thread"].mode == "idle"
+        assert config.reset_by_type["thread"].idle_minutes == 120
+        # Priority: by_platform > by_type > default.
+        assert config.get_reset_policy(platform=Platform.DISCORD, session_type="thread").mode == "none"
+        assert config.get_reset_policy(session_type="thread").mode == "idle"
+        assert config.get_reset_policy().mode == "both"
+
+    def test_session_reset_override_policies_are_validated(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "session_reset:\n"
+            "  by_platform:\n"
+            "    discord:\n"
+            "      mode: idle\n"
+            "      idle_minutes: 0\n"
+            "  by_type:\n"
+            "    thread:\n"
+            "      mode: daily\n"
+            "      at_hour: 99\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.reset_by_platform[Platform.DISCORD].idle_minutes == 1440
+        assert config.reset_by_type["thread"].at_hour == 4
 
     def test_bridges_quoted_false_always_log_local_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"

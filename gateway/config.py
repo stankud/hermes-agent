@@ -717,10 +717,79 @@ def load_gateway_config() -> GatewayConfig:
                 yaml_cfg = yaml.safe_load(f) or {}
 
             # Map config.yaml keys → GatewayConfig.from_dict() schema.
-            # Each key overwrites whatever gateway.json may have set.
+            # Each key overwrites whatever gateway.json may have set.  Within
+            # session_reset, default/by_platform/by_type are independent slots:
+            # a YAML key only overrides its own slot, and slots absent from
+            # YAML keep their gateway.json values.
             sr = yaml_cfg.get("session_reset")
             if sr and isinstance(sr, dict):
-                gw_data["default_reset_policy"] = sr
+                # Split nested by_platform / by_type overrides out of the
+                # session_reset block before forwarding the rest as the
+                # default policy.  Lets users write all reset config under
+                # one heading:
+                #
+                #   session_reset:
+                #     mode: both
+                #     idle_minutes: 1440
+                #     by_platform:
+                #       discord: { mode: none }
+                #     by_type:
+                #       thread: { mode: none }
+                #
+                # Priority at resolution time: by_platform > by_type > default.
+                sr_default = {
+                    k: v for k, v in sr.items()
+                    if k not in ("by_platform", "by_type")
+                }
+                if sr_default:
+                    gw_data["default_reset_policy"] = sr_default
+
+                # Empty/all-invalid maps are treated as no-ops (gateway.json
+                # overrides preserved), mirroring the older top-level
+                # session_reset: {} semantics.
+                by_platform = sr.get("by_platform")
+                if isinstance(by_platform, dict):
+                    valid_by_platform = {}
+                    for platform_name, policy_data in by_platform.items():
+                        if isinstance(policy_data, dict):
+                            valid_by_platform[platform_name] = policy_data
+                        else:
+                            logger.warning(
+                                "Ignoring invalid session_reset.by_platform.%s "
+                                "in config.yaml (expected mapping, got %s)",
+                                platform_name,
+                                type(policy_data).__name__,
+                            )
+                    if valid_by_platform:
+                        gw_data["reset_by_platform"] = valid_by_platform
+                elif by_platform is not None:
+                    logger.warning(
+                        "Ignoring invalid session_reset.by_platform in "
+                        "config.yaml (expected mapping, got %s)",
+                        type(by_platform).__name__,
+                    )
+
+                by_type = sr.get("by_type")
+                if isinstance(by_type, dict):
+                    valid_by_type = {}
+                    for type_name, policy_data in by_type.items():
+                        if isinstance(policy_data, dict):
+                            valid_by_type[type_name] = policy_data
+                        else:
+                            logger.warning(
+                                "Ignoring invalid session_reset.by_type.%s "
+                                "in config.yaml (expected mapping, got %s)",
+                                type_name,
+                                type(policy_data).__name__,
+                            )
+                    if valid_by_type:
+                        gw_data["reset_by_type"] = valid_by_type
+                elif by_type is not None:
+                    logger.warning(
+                        "Ignoring invalid session_reset.by_type in "
+                        "config.yaml (expected mapping, got %s)",
+                        type(by_type).__name__,
+                    )
 
             qc = yaml_cfg.get("quick_commands")
             if qc is not None:
@@ -1144,20 +1213,24 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
     Called by ``load_gateway_config()`` after all config sources are merged.
     Extracted as a separate function for testability.
     """
-    policy = config.default_reset_policy
+    reset_policies = [
+        config.default_reset_policy,
+        *config.reset_by_platform.values(),
+        *config.reset_by_type.values(),
+    ]
+    for policy in reset_policies:
+        if not (0 <= policy.at_hour <= 23):
+            logger.warning(
+                "Invalid at_hour=%s (must be 0-23). Using default 4.", policy.at_hour
+            )
+            policy.at_hour = 4
 
-    if not (0 <= policy.at_hour <= 23):
-        logger.warning(
-            "Invalid at_hour=%s (must be 0-23). Using default 4.", policy.at_hour
-        )
-        policy.at_hour = 4
-
-    if policy.idle_minutes is None or policy.idle_minutes <= 0:
-        logger.warning(
-            "Invalid idle_minutes=%s (must be positive). Using default 1440.",
-            policy.idle_minutes,
-        )
-        policy.idle_minutes = 1440
+        if policy.idle_minutes is None or policy.idle_minutes <= 0:
+            logger.warning(
+                "Invalid idle_minutes=%s (must be positive). Using default 1440.",
+                policy.idle_minutes,
+            )
+            policy.idle_minutes = 1440
 
     # Warn about empty bot tokens — platforms that loaded an empty string
     # won't connect and the cause can be confusing without a log line.

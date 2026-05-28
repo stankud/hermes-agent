@@ -1335,6 +1335,23 @@ For separate natural mid-turn assistant updates without progressive token editin
 Streaming is disabled by default. Enable it in `~/.hermes/config.yaml` to try the streaming UX.
 :::
 
+## Session Reset Policies
+
+Control when gateway sessions automatically reset:
+
+```yaml
+session_reset:
+  mode: both
+  idle_minutes: 1440
+  at_hour: 4
+  by_platform:
+    discord: { mode: none }
+  by_type:
+    thread: { mode: none }
+```
+
+Resolution priority is `by_platform` > `by_type` > the top-level `session_reset` default. `by_type` keys match session types such as `dm`, `group`, `channel`, `thread`, `forum` (Telegram topics), or `webhook`.
+
 ## Group Chat Session Isolation
 
 Control whether shared chats keep one conversation per room or one conversation per participant:
